@@ -1,0 +1,105 @@
+name: Atlas-X-AI reusable CI
+
+on:
+  workflow_call:
+    inputs:
+      python-version:
+        description: "Python version (default 3.12)"
+        type: string
+        required: false
+        default: "3.12"
+      skip-tests:
+        description: "Skip the pytest job (for docs-only repos)"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  gitleaks:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history for history-scan)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Run gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  trufflehog:
+    name: Secret scan (trufflehog)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Run TruffleHog
+        env:
+          HEAD_REF: ${{ github.ref_name }}
+        uses: trufflesecurity/trufflehog@main
+        with:
+          base: ""
+          head: ${{ env.HEAD_REF }}
+          extra_args: --results=verified,unknown
+
+  python-tests:
+    name: Python tests (pytest via uv)
+    runs-on: ubuntu-latest
+    if: ${{ !inputs.skip-tests }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check for pyproject.toml
+        id: detect
+        run: |
+          if [ -f pyproject.toml ]; then
+            echo "is_python=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_python=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No pyproject.toml found - skipping Python tests."
+          fi
+      - name: Install uv
+        if: steps.detect.outputs.is_python == 'true'
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+          enable-cache: true
+      - name: Sync dev deps
+        if: steps.detect.outputs.is_python == 'true'
+        run: uv sync --all-extras --dev
+      - name: Run pytest
+        if: steps.detect.outputs.is_python == 'true'
+        run: |
+          if [ -d tests ]; then
+            uv run pytest tests -v
+          else
+            echo "::notice::No tests/ directory - skipping."
+          fi
+
+  python-lint:
+    name: Python lint (ruff)
+    runs-on: ubuntu-latest
+    if: ${{ !inputs.skip-tests }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check for pyproject.toml
+        id: detect
+        run: |
+          if [ -f pyproject.toml ]; then
+            echo "is_python=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_python=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Install uv
+        if: steps.detect.outputs.is_python == 'true'
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+      - name: Run ruff check
+        if: steps.detect.outputs.is_python == 'true'
+        run: uv tool run ruff check . || echo "::warning::ruff lint issues - fix before merging if possible"
