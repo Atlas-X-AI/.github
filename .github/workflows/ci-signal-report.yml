@@ -160,6 +160,21 @@ jobs:
                 return response.data;
               }
 
+              const headRef = (context.ref || '').replace(/^refs\/heads\//, '');
+              if (headRef) {
+                const response = await github.rest.pulls.list({
+                  owner,
+                  repo,
+                  state: 'open',
+                  head: `${owner}:${headRef}`,
+                  per_page: 1,
+                });
+
+                if (response.data.length > 0) {
+                  return response.data[0];
+                }
+              }
+
               core.notice('No pull request payload or input PR number was provided.');
               return null;
             }
