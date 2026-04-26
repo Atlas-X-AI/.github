@@ -35,15 +35,13 @@ jobs:
 
     steps:
       - name: Enforce PR body contract
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         env:
           PR_BODY: ${{ github.event.pull_request.body || '' }}
           ENFORCE_DRAFT: ${{ inputs.enforce_draft }}
           STRICT_REFERENCES: ${{ inputs.strict_references }}
         with:
           script: |
-            const core = require('@actions/core');
-
             const pr = context.payload.pull_request;
             if (!pr) {
               core.notice('No pull request payload found; nothing to validate.');
