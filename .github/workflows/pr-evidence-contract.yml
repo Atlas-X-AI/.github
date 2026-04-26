@@ -1,0 +1,272 @@
+name: PR Evidence Contract
+
+# Reusable PR-body governance workflow. Safe on pull_request_target because
+# it never checks out PR-head code; it only reads metadata from the event.
+
+on:
+  workflow_call:
+    inputs:
+      enforce_draft:
+        description: Convert invalid PRs back to draft
+        required: false
+        type: boolean
+        default: true
+      strict_references:
+        description: Require concrete reference tokens in discovery/evidence sections
+        required: false
+        type: boolean
+        default: true
+  pull_request_target:
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: pr-evidence-contract-${{ github.repository }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  pr-evidence-contract:
+    name: PR Evidence Contract
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Enforce PR body contract
+        uses: actions/github-script@v7
+        env:
+          PR_BODY: ${{ github.event.pull_request.body || '' }}
+          ENFORCE_DRAFT: ${{ inputs.enforce_draft }}
+          STRICT_REFERENCES: ${{ inputs.strict_references }}
+        with:
+          script: |
+            const core = require('@actions/core');
+
+            const pr = context.payload.pull_request;
+            if (!pr) {
+              core.notice('No pull request payload found; nothing to validate.');
+              return;
+            }
+
+            const body = (process.env.PR_BODY || '').replace(/\r\n/g, '\n');
+            const enforceDraft = String(process.env.ENFORCE_DRAFT).toLowerCase() !== 'false';
+            const strictReferences = String(process.env.STRICT_REFERENCES).toLowerCase() !== 'false';
+            const marker = '<!-- pr-evidence-contract-comment -->';
+
+            const sectionSpecs = [
+              { heading: 'Summary' },
+              { heading: 'Why' },
+              { heading: 'Discovery', requireBullet: true, requireReference: true },
+              { heading: 'Decision / Architecture' },
+              { heading: 'What Changed', requireBullet: true },
+              { heading: 'Evidence / References', requireBullet: true, requireReference: true },
+              { heading: 'No-Reference Justification', allowNone: true },
+              { heading: 'Doubts / Risks / Critic', requireBullet: true },
+              { heading: 'Validation', requireBullet: true },
+              { heading: 'Requested Feedback', requireBullet: true },
+              { heading: 'Follow-Up', allowNone: true },
+            ];
+
+            function normalizeHeading(value) {
+              return value.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+            }
+
+            function stripComments(value) {
+              return value.replace(/<!--[\s\S]*?-->/g, '').trim();
+            }
+
+            function normalizeContent(value) {
+              return stripComments(value)
+                .replace(/^\s*[-*]\s*/gm, '')
+                .replace(/^\s*\d+\.\s*/gm, '')
+                .trim();
+            }
+
+            function isPlaceholderOnly(value, allowNone = false) {
+              const normalized = normalizeContent(value);
+              if (!normalized) return true;
+              if (allowNone && /^none\.?$/i.test(normalized)) return false;
+
+              const placeholderPatterns = [
+                /^todo\.?$/i,
+                /^tbd\.?$/i,
+                /^n\/a\.?$/i,
+                /^replace me\.?$/i,
+                /^fill (this|me|out).?$/i,
+                /^write .+$/i,
+                /^example\.?$/i,
+              ];
+
+              return placeholderPatterns.some((pattern) => pattern.test(normalized));
+            }
+
+            function hasBullet(value) {
+              return /^\s*[-*]\s+\S+/m.test(value) || /^\s*\d+\.\s+\S+/m.test(value);
+            }
+
+            function hasReferenceToken(value) {
+              const patterns = [
+                /\[[^\]]+\]\(([^)]+)\)/,
+                /https?:\/\/\S+/,
+                /(^|\s)#\d+\b/,
+                /`[^`\n]*\/[^`\n]*`/,
+                /`[^`\n]+\.[a-z0-9]+`/i,
+                /\b[0-9a-f]{7,40}\b/i,
+              ];
+              return patterns.some((pattern) => pattern.test(value));
+            }
+
+            function parseSections(markdown) {
+              const matches = [...markdown.matchAll(/^##\s+(.+?)\s*$/gm)];
+              const sections = new Map();
+
+              for (let i = 0; i < matches.length; i += 1) {
+                const current = matches[i];
+                const next = matches[i + 1];
+                const heading = current[1].trim();
+                const start = current.index + current[0].length;
+                const end = next ? next.index : markdown.length;
+                sections.set(normalizeHeading(heading), {
+                  heading,
+                  content: markdown.slice(start, end).trim(),
+                });
+              }
+
+              return sections;
+            }
+
+            const sections = parseSections(body);
+            const failures = [];
+
+            for (const spec of sectionSpecs) {
+              const key = normalizeHeading(spec.heading);
+              const section = sections.get(key);
+
+              if (!section) {
+                failures.push(`Missing section: \`## ${spec.heading}\`.`);
+                continue;
+              }
+
+              if (isPlaceholderOnly(section.content, spec.allowNone)) {
+                failures.push(`Section \`## ${spec.heading}\` is empty or still contains placeholder text.`);
+                continue;
+              }
+
+              if (spec.requireBullet && !hasBullet(section.content)) {
+                failures.push(`Section \`## ${spec.heading}\` should contain at least one bullet for scanability.`);
+              }
+
+              if (strictReferences && spec.requireReference && !hasReferenceToken(section.content)) {
+                failures.push(
+                  `Section \`## ${spec.heading}\` needs at least one reference token such as a doc link, PR or issue ref, file path, or commit SHA.`,
+                );
+              }
+            }
+
+            const evidenceSection = sections.get(normalizeHeading('Evidence / References'));
+            const noReferenceSection = sections.get(normalizeHeading('No-Reference Justification'));
+
+            if (
+              strictReferences &&
+              evidenceSection &&
+              !hasReferenceToken(evidenceSection.content) &&
+              (!noReferenceSection || /^none\.?$/i.test(normalizeContent(noReferenceSection.content)))
+            ) {
+              failures.push(
+                'Add at least one concrete reference in `## Evidence / References`, or explain the gap in `## No-Reference Justification`.',
+              );
+            }
+
+            const ok = failures.length === 0;
+
+            const reportLines = [
+              marker,
+              `## PR Evidence Contract ${ok ? 'passed' : 'needs updates'}`,
+              '',
+              ok
+                ? 'The PR body matches the expected human and AI collaboration contract.'
+                : 'The PR body is missing required context for a reviewer to trust the change quickly.',
+              '',
+            ];
+
+            if (!ok) {
+              reportLines.push('### Fix Before Merge');
+              reportLines.push('');
+              for (const failure of failures) {
+                reportLines.push(`- ${failure}`);
+              }
+              reportLines.push('');
+            }
+
+            reportLines.push('### Required Shape');
+            reportLines.push('');
+            for (const spec of sectionSpecs) {
+              reportLines.push(`- \`## ${spec.heading}\``);
+            }
+            reportLines.push('');
+            reportLines.push(
+              'Every major claim should trace to `## Evidence / References`, or be explained in plain English in `## No-Reference Justification`.',
+            );
+            if (enforceDraft) {
+              reportLines.push('');
+              reportLines.push('Invalid PRs are converted back to draft so the contract cannot be ignored accidentally.');
+            }
+
+            const report = reportLines.join('\n');
+            await core.summary.addRaw(report, true).write();
+
+            const { owner, repo } = context.repo;
+            const issue_number = pr.number;
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number,
+              per_page: 100,
+            });
+
+            const existing = comments.find((comment) =>
+              comment.user?.type === 'Bot' && comment.body?.includes(marker)
+            );
+
+            if (ok) {
+              if (existing) {
+                await github.rest.issues.deleteComment({
+                  owner,
+                  repo,
+                  comment_id: existing.id,
+                });
+              }
+              return;
+            }
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner,
+                repo,
+                comment_id: existing.id,
+                body: report,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number,
+                body: report,
+              });
+            }
+
+            if (enforceDraft && !pr.draft) {
+              try {
+                await github.graphql(
+                  'mutation($id:ID!){ convertPullRequestToDraft(input:{pullRequestId:$id}) { clientMutationId } }',
+                  { id: pr.node_id },
+                );
+              } catch (error) {
+                core.warning(`Failed to convert PR to draft: ${error.message}`);
+              }
+            }
+
+            core.setFailed('PR evidence contract failed.');

@@ -1,6 +1,6 @@
 # Atlas-X-AI / .github
 
-Org-level configuration repo. Contains the **reusable CI workflow** every Atlas-X-AI repo calls, plus the "going public" ceremony docs.
+Org-level defaults and reusable workflows for Atlas-X-AI repositories.
 
 ## Reusable CI workflow
 
@@ -52,6 +52,38 @@ After wiring up `ci.yml`, enable branch protection on `main` via repo Settings �
 - Require branches to be up to date before merging
 - Do not allow bypassing the above
 
+## PR Evidence Contract
+
+Files:
+
+- [`pull_request_template.md`](pull_request_template.md)
+- [`.github/workflows/pr-evidence-contract.yml`](.github/workflows/pr-evidence-contract.yml)
+
+The template provides the default PR body shape across Atlas-X-AI repositories. The workflow enforces the same contract by validating PR bodies, adding a bot comment when context is missing, failing the run, and converting noncompliant PRs back to draft.
+
+To enforce it in a repo, add this caller workflow:
+
+```yaml
+name: PR Evidence Contract
+
+on:
+  pull_request_target:
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  pr-evidence-contract:
+    uses: Atlas-X-AI/.github/.github/workflows/pr-evidence-contract.yml@main
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+```
+
 ## Going-public ceremony
 
 When a private Atlas-X-AI repo graduates to public release: see [`docs/going-public.md`](docs/going-public.md).
@@ -60,6 +92,6 @@ Short version: squash all history into one orphan commit, run scanners against t
 
 ## Why this repo exists
 
-- **Single source of truth** for org-wide CI. Improvements here apply to every repo automatically.
+- **Single source of truth** for org-wide CI and PR governance. Improvements here apply to every repo automatically.
 - **`.github` is a special repo name** — GitHub recognizes it as the org-level defaults location.
-- **Private by design.** Reusable workflows in a private `.github` repo can be called by other private repos in the same org, provided org Settings → Actions → General → "Allow access to reusable workflows from private repositories" is enabled (one-time toggle).
+- **Public by design.** Default pull request templates require a public `.github` repo, and public reusable workflows can be called by both public and private repositories in the same owner space.
