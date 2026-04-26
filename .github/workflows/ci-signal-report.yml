@@ -1,0 +1,626 @@
+name: CI Signal Report
+
+# Reusable workflow that explains current PR check state from the trusted base
+# branch context. It never checks out PR-head code.
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        description: PR number to inspect when no pull_request payload is present
+        required: false
+        type: string
+        default: ""
+      wait_for_checks:
+        description: Poll for a short window so concurrent checks can settle
+        required: false
+        type: boolean
+        default: true
+      max_wait_seconds:
+        description: Maximum time to wait for other checks to leave a pending state
+        required: false
+        type: number
+        default: 300
+      poll_interval_seconds:
+        description: Poll interval while waiting for checks
+        required: false
+        type: number
+        default: 20
+      base_run_window:
+        description: How many recent base-branch workflow runs to inspect for baseline comparison
+        required: false
+        type: number
+        default: 5
+
+permissions:
+  actions: read
+  checks: read
+  contents: read
+  issues: write
+  pull-requests: read
+  statuses: read
+
+concurrency:
+  group: ci-signal-report-${{ github.repository }}-${{ github.event.pull_request.number || inputs.pr_number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  ci-signal-report:
+    name: CI Signal Report
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Build CI signal report
+        uses: actions/github-script@v8
+        env:
+          PR_NUMBER: ${{ inputs.pr_number }}
+          WAIT_FOR_CHECKS: ${{ inputs.wait_for_checks }}
+          MAX_WAIT_SECONDS: ${{ inputs.max_wait_seconds }}
+          POLL_INTERVAL_SECONDS: ${{ inputs.poll_interval_seconds }}
+          BASE_RUN_WINDOW: ${{ inputs.base_run_window }}
+        with:
+          script: |
+            const marker = '<!-- ci-signal-report -->';
+            const waitForChecks = String(process.env.WAIT_FOR_CHECKS).toLowerCase() !== 'false';
+            const maxWaitSeconds = Number(process.env.MAX_WAIT_SECONDS || '300');
+            const pollIntervalSeconds = Number(process.env.POLL_INTERVAL_SECONDS || '20');
+            const baseRunWindow = Number(process.env.BASE_RUN_WINDOW || '5');
+            const prNumberInput = Number(process.env.PR_NUMBER || '0');
+            const selfRunId = String(context.runId);
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            const successLike = new Set(['success', 'neutral', 'skipped']);
+            const failureLike = new Set(['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure', 'stale']);
+            const activeLike = new Set(['queued', 'requested', 'waiting', 'pending', 'in_progress']);
+
+            function sleep(ms) {
+              return new Promise((resolve) => setTimeout(resolve, ms));
+            }
+
+            function asDateString(value) {
+              if (!value) return 'unknown date';
+              return new Date(value).toISOString().slice(0, 10);
+            }
+
+            function normalizeCheckState(check) {
+              if (check.status && check.status !== 'completed') return 'pending';
+              if (successLike.has(check.conclusion)) return 'success';
+              if (failureLike.has(check.conclusion)) return check.conclusion;
+              return check.conclusion || 'pending';
+            }
+
+            function normalizeStatusState(status) {
+              if (status.state === 'success') return 'success';
+              if (status.state === 'pending') return 'pending';
+              if (status.state === 'failure' || status.state === 'error') return 'failure';
+              return status.state || 'pending';
+            }
+
+            function isFailureState(state) {
+              return failureLike.has(state);
+            }
+
+            function isActiveState(state) {
+              return state === 'pending' || activeLike.has(state);
+            }
+
+            function isSelfItem(name, detailsUrl) {
+              if (name === 'CI Signal Report') return true;
+              return Boolean(detailsUrl && detailsUrl.includes(`/actions/runs/${selfRunId}`));
+            }
+
+            function classifyCategory(item) {
+              const haystack = [
+                item.name,
+                item.workflowName,
+                item.jobName,
+                item.failedStep,
+                item.summary,
+                item.appSlug,
+              ]
+                .filter(Boolean)
+                .join(' ')
+                .toLowerCase();
+
+              if (/(pr evidence|review-gate|atlas review|claude code review|blocking-issues|commitlint|\breview\b)/.test(haystack)) {
+                return 'policy';
+              }
+
+              if (/(vercel|deploy|preview|release|publish|pages|netlify|railway|render)/.test(haystack)) {
+                return 'deploy';
+              }
+
+              if (
+                /(npm ci|pnpm install|yarn install|pip install|poetry install|bundle install|cargo fetch|setup node|setup python|dependency|peer dep|eresolve|module not found|file not found|install dependencies|restore cache)/.test(
+                  haystack,
+                )
+              ) {
+                return 'infra/deps';
+              }
+
+              if (/(test|lint|ruff|eslint|typecheck|type check|tsc|build|compile|vitest|jest|pytest|smoke)/.test(haystack)) {
+                return 'code/test';
+              }
+
+              return 'unknown';
+            }
+
+            async function resolvePullRequest() {
+              if (context.payload.pull_request) {
+                return context.payload.pull_request;
+              }
+
+              if (prNumberInput > 0) {
+                const response = await github.rest.pulls.get({
+                  owner,
+                  repo,
+                  pull_number: prNumberInput,
+                });
+                return response.data;
+              }
+
+              core.notice('No pull request payload or input PR number was provided.');
+              return null;
+            }
+
+            async function listComments(issueNumber) {
+              return github.paginate(github.rest.issues.listComments, {
+                owner,
+                repo,
+                issue_number: issueNumber,
+                per_page: 100,
+              });
+            }
+
+            async function upsertComment(issueNumber, body, keepComment) {
+              const comments = await listComments(issueNumber);
+              const existing = comments.find((comment) => comment.user?.type === 'Bot' && comment.body?.includes(marker));
+
+              if (!keepComment) {
+                if (existing) {
+                  await github.rest.issues.deleteComment({
+                    owner,
+                    repo,
+                    comment_id: existing.id,
+                  });
+                }
+                return;
+              }
+
+              if (existing) {
+                await github.rest.issues.updateComment({
+                  owner,
+                  repo,
+                  comment_id: existing.id,
+                  body,
+                });
+                return;
+              }
+
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: issueNumber,
+                body,
+              });
+            }
+
+            async function fetchCheckRuns(headSha) {
+              const response = await github.rest.checks.listForRef({
+                owner,
+                repo,
+                ref: headSha,
+                per_page: 100,
+              });
+              return response.data.check_runs || [];
+            }
+
+            async function fetchStatuses(headSha) {
+              const response = await github.rest.repos.getCombinedStatusForRef({
+                owner,
+                repo,
+                ref: headSha,
+                per_page: 100,
+              });
+              return response.data.statuses || [];
+            }
+
+            async function getRunMetadata(runId) {
+              try {
+                const runResponse = await github.request('GET /repos/{owner}/{repo}/actions/runs/{run_id}', {
+                  owner,
+                  repo,
+                  run_id: runId,
+                });
+                const jobsResponse = await github.rest.actions.listJobsForWorkflowRun({
+                  owner,
+                  repo,
+                  run_id: runId,
+                  per_page: 100,
+                });
+                return {
+                  run: runResponse.data,
+                  jobs: jobsResponse.data.jobs || [],
+                };
+              } catch (error) {
+                return {
+                  run: null,
+                  jobs: [],
+                  lookupError: error.message,
+                };
+              }
+            }
+
+            function summarizeFailure(item) {
+              if (item.failedStep) {
+                return `failed at step \`${item.failedStep}\``;
+              }
+              if (item.jobName && item.jobName !== item.name) {
+                return `failed in job \`${item.jobName}\``;
+              }
+              if (item.summary) {
+                return item.summary;
+              }
+              return 'see check details';
+            }
+
+            async function compareWithBase(item, baseRef) {
+              if (!item.workflowId || !item.jobName) {
+                return {
+                  verdict: 'unknown',
+                  detail: 'No matching GitHub Actions workflow/job metadata to compare against the base branch.',
+                };
+              }
+
+              try {
+                const runsResponse = await github.request(
+                  'GET /repos/{owner}/{repo}/actions/workflows/{workflow_id}/runs',
+                  {
+                    owner,
+                    repo,
+                    workflow_id: item.workflowId,
+                    branch: baseRef,
+                    status: 'completed',
+                    per_page: baseRunWindow,
+                  },
+                );
+
+                const workflowRuns = (runsResponse.data.workflow_runs || []).filter(
+                  (run) => run.id !== item.runId && run.head_branch === baseRef,
+                );
+
+                const preferredBaseRun =
+                  workflowRuns.find((run) => run.event === 'push') ||
+                  workflowRuns.find((run) => run.event === 'workflow_dispatch') ||
+                  workflowRuns[0];
+
+                if (!preferredBaseRun) {
+                  return {
+                    verdict: 'unknown',
+                    detail: `No recent completed \`${item.workflowName || item.name}\` run was found on \`${baseRef}\`.`,
+                  };
+                }
+
+                const baseJobsResponse = await github.rest.actions.listJobsForWorkflowRun({
+                  owner,
+                  repo,
+                  run_id: preferredBaseRun.id,
+                  per_page: 100,
+                });
+
+                const baseJobs = baseJobsResponse.data.jobs || [];
+                const matchingBaseJob =
+                  baseJobs.find((job) => job.name === item.jobName) ||
+                  baseJobs.find((job) => job.name === item.name);
+
+                if (!matchingBaseJob) {
+                  if (preferredBaseRun.conclusion === 'success') {
+                    return {
+                      verdict: 'likely-pr-specific',
+                      detail: `Latest \`${baseRef}\` workflow run on ${asDateString(preferredBaseRun.created_at)} passed overall.`,
+                    };
+                  }
+
+                  return {
+                    verdict: 'unknown',
+                    detail: `Latest \`${baseRef}\` workflow run on ${asDateString(preferredBaseRun.created_at)} finished \`${preferredBaseRun.conclusion}\`, but the matching job name was not found.`,
+                  };
+                }
+
+                const baseState = normalizeCheckState({
+                  status: 'completed',
+                  conclusion: matchingBaseJob.conclusion,
+                });
+
+                if (baseState === 'success') {
+                  return {
+                    verdict: 'likely-pr-specific',
+                    detail: `Matching job passed on \`${baseRef}\` in the latest run from ${asDateString(preferredBaseRun.created_at)}.`,
+                  };
+                }
+
+                if (isFailureState(baseState)) {
+                  return {
+                    verdict: 'likely-inherited',
+                    detail: `Matching job was already failing on \`${baseRef}\` in the latest run from ${asDateString(preferredBaseRun.created_at)}.`,
+                  };
+                }
+
+                return {
+                  verdict: 'unknown',
+                  detail: `Matching job on \`${baseRef}\` finished \`${baseState}\` in the latest run from ${asDateString(preferredBaseRun.created_at)}.`,
+                };
+              } catch (error) {
+                return {
+                  verdict: 'unknown',
+                  detail: `Base-branch comparison failed: ${error.message}`,
+                };
+              }
+            }
+
+            async function enrichCheckRun(check, baseRef) {
+              const item = {
+                source: 'check-run',
+                name: check.name,
+                state: normalizeCheckState(check),
+                detailsUrl: check.details_url || check.html_url || '',
+                summary: '',
+                workflowName: '',
+                jobName: check.name,
+                failedStep: '',
+                appSlug: check.app?.slug || '',
+                workflowId: null,
+                runId: null,
+                baseComparison: {
+                  verdict: 'unknown',
+                  detail: 'Base-branch comparison was not attempted.',
+                },
+              };
+
+              const runMatch = item.detailsUrl.match(/\/actions\/runs\/(\d+)/);
+              if (runMatch) {
+                const runId = Number(runMatch[1]);
+                item.runId = runId;
+                const metadata = await getRunMetadata(runId);
+                if (metadata.run) {
+                  item.workflowName = metadata.run.name || '';
+                  item.workflowId = metadata.run.workflow_id || null;
+                  const matchingJob =
+                    metadata.jobs.find((job) => job.name === check.name) ||
+                    (metadata.jobs.filter((job) => isFailureState(normalizeCheckState({
+                      status: 'completed',
+                      conclusion: job.conclusion,
+                    }))).length === 1
+                      ? metadata.jobs.find((job) =>
+                          isFailureState(
+                            normalizeCheckState({
+                              status: 'completed',
+                              conclusion: job.conclusion,
+                            }),
+                          ),
+                        )
+                      : null);
+
+                  if (matchingJob) {
+                    item.jobName = matchingJob.name;
+                    const failedStep = (matchingJob.steps || []).find(
+                      (step) => step.conclusion && !successLike.has(step.conclusion),
+                    );
+                    if (failedStep) {
+                      item.failedStep = failedStep.name;
+                    }
+                  }
+                } else if (metadata.lookupError) {
+                  item.summary = metadata.lookupError;
+                }
+              }
+
+              item.category = classifyCategory(item);
+              if (item.appSlug === 'github-actions' && isFailureState(item.state)) {
+                item.baseComparison = await compareWithBase(item, baseRef);
+              } else if (isActiveState(item.state)) {
+                item.baseComparison = {
+                  verdict: 'pending',
+                  detail: 'Comparison skipped because the check has not finished yet.',
+                };
+              } else {
+                item.baseComparison = {
+                  verdict: 'unknown',
+                  detail: 'External or non-failing checks are not compared against the base branch.',
+                };
+              }
+
+              return item;
+            }
+
+            function enrichStatus(status) {
+              const item = {
+                source: 'status',
+                name: status.context,
+                state: normalizeStatusState(status),
+                detailsUrl: status.target_url || '',
+                summary: status.description || '',
+                workflowName: '',
+                jobName: '',
+                failedStep: '',
+                appSlug: 'status',
+              };
+
+              item.category = classifyCategory(item);
+              item.baseComparison = {
+                verdict: 'unknown',
+                detail: 'Legacy commit statuses are not compared against the base branch.',
+              };
+              return item;
+            }
+
+            async function collectSnapshot(pr) {
+              const headSha = pr.head.sha;
+              const checkRuns = await fetchCheckRuns(headSha);
+              const statuses = await fetchStatuses(headSha);
+
+              const rawItems = [];
+              for (const check of checkRuns) {
+                const state = normalizeCheckState(check);
+                if (isSelfItem(check.name, check.details_url || check.html_url || '')) continue;
+                rawItems.push({
+                  source: 'check-run',
+                  name: check.name,
+                  state,
+                  detailsUrl: check.details_url || check.html_url || '',
+                  raw: check,
+                });
+              }
+
+              for (const status of statuses) {
+                const state = normalizeStatusState(status);
+                if (isSelfItem(status.context, status.target_url || '')) continue;
+                rawItems.push({
+                  source: 'status',
+                  name: status.context,
+                  state,
+                  detailsUrl: status.target_url || '',
+                  raw: status,
+                });
+              }
+
+              const active = rawItems.filter((item) => isActiveState(item.state));
+              const failures = rawItems.filter((item) => isFailureState(item.state));
+              const successCount = rawItems.filter((item) => item.state === 'success').length;
+
+              const interestingItems = [];
+              for (const item of rawItems) {
+                if (!isFailureState(item.state) && !isActiveState(item.state)) continue;
+                if (item.source === 'check-run') {
+                  interestingItems.push(await enrichCheckRun(item.raw, pr.base.ref));
+                } else {
+                  interestingItems.push(enrichStatus(item.raw));
+                }
+              }
+
+              return {
+                activeCount: active.length,
+                failureCount: failures.length,
+                successCount,
+                items: interestingItems,
+              };
+            }
+
+            function formatItem(item) {
+              const stateLabel =
+                item.state === 'pending'
+                  ? 'pending'
+                  : item.state.replace(/_/g, ' ');
+
+              const categoryLabel = item.category === 'unknown' ? 'needs triage' : item.category;
+              const failureSummary = summarizeFailure(item);
+
+              let baselineSummary = item.baseComparison?.detail || 'No base-branch comparison available.';
+              if (item.baseComparison?.verdict === 'likely-inherited') {
+                baselineSummary = `likely inherited: ${baselineSummary}`;
+              } else if (item.baseComparison?.verdict === 'likely-pr-specific') {
+                baselineSummary = `likely PR-specific: ${baselineSummary}`;
+              } else if (item.baseComparison?.verdict === 'pending') {
+                baselineSummary = `still pending: ${baselineSummary}`;
+              }
+
+              const details = item.detailsUrl ? ` [details](${item.detailsUrl})` : '';
+              return `- \`${item.name}\` is ${stateLabel}; category \`${categoryLabel}\`; ${failureSummary}; ${baselineSummary}.${details}`;
+            }
+
+            function sectionLabel(category) {
+              return {
+                policy: 'Policy / Governance',
+                'infra/deps': 'Infra / Dependencies',
+                'code/test': 'Code / Tests',
+                deploy: 'Deploy',
+                unknown: 'Needs Triage',
+              }[category];
+            }
+
+            function summarizeNextActions(snapshot) {
+              const actions = [];
+              if (snapshot.items.some((item) => item.category === 'policy' && isFailureState(item.state))) {
+                actions.push('Resolve review-gate or PR-contract findings before treating these failures as product regressions.');
+              }
+              if (snapshot.items.some((item) => item.category === 'infra/deps' && isFailureState(item.state))) {
+                actions.push('Inspect install and dependency setup before touching product code; these failures usually come from version or config drift.');
+              }
+              if (snapshot.items.some((item) => item.category === 'code/test' && isFailureState(item.state))) {
+                actions.push('Reproduce the named failing job locally, or compare against the latest base-branch run if the report marks it as inherited.');
+              }
+              if (snapshot.items.some((item) => isActiveState(item.state))) {
+                actions.push('Some checks are still running; rerun this workflow with `workflow_dispatch` if you need a fresh snapshot after long jobs finish.');
+              }
+              if (!actions.length) {
+                actions.push('No action needed from this report. Active checks are green or already cleared.');
+              }
+              return actions;
+            }
+
+            const pr = await resolvePullRequest();
+            if (!pr) {
+              return;
+            }
+
+            let snapshot = await collectSnapshot(pr);
+            let waitedSeconds = 0;
+
+            while (waitForChecks && snapshot.activeCount > 0 && waitedSeconds < maxWaitSeconds) {
+              core.info(
+                `CI Signal Report waiting: ${snapshot.activeCount} checks still pending after ${waitedSeconds}s for PR #${pr.number}.`,
+              );
+              await sleep(pollIntervalSeconds * 1000);
+              waitedSeconds += pollIntervalSeconds;
+              snapshot = await collectSnapshot(pr);
+            }
+
+            const grouped = {
+              policy: [],
+              'infra/deps': [],
+              'code/test': [],
+              deploy: [],
+              unknown: [],
+            };
+
+            for (const item of snapshot.items) {
+              grouped[item.category]?.push(item);
+            }
+
+            const keepComment = snapshot.failureCount > 0 || snapshot.activeCount > 0;
+
+            const lines = [
+              marker,
+              `## CI Signal Report ${keepComment ? 'needs attention' : 'is clean'}`,
+              '',
+              `- Snapshot: ${snapshot.failureCount} failing, ${snapshot.activeCount} pending, ${snapshot.successCount} passing checks on \`${pr.head.sha.slice(0, 7)}\`.`,
+              `- PR: #${pr.number}`,
+              `- Base branch: \`${pr.base.ref}\``,
+              `- Waited: ${waitedSeconds}s${snapshot.activeCount > 0 ? ' and some checks are still pending.' : '.'}`,
+              '',
+            ];
+
+            if (keepComment) {
+              for (const category of ['policy', 'infra/deps', 'code/test', 'deploy', 'unknown']) {
+                if (!grouped[category].length) continue;
+                lines.push(`### ${sectionLabel(category)}`);
+                lines.push('');
+                for (const item of grouped[category]) {
+                  lines.push(formatItem(item));
+                }
+                lines.push('');
+              }
+
+              lines.push('### Next Actions');
+              lines.push('');
+              for (const action of summarizeNextActions(snapshot)) {
+                lines.push(`- ${action}`);
+              }
+            } else {
+              lines.push('All current visible checks are green. No PR comment is retained.');
+            }
+
+            const report = lines.join('\n');
+            await core.summary.addRaw(report, true).write();
+            await upsertComment(pr.number, report, keepComment);
