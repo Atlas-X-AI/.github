@@ -22,7 +22,7 @@ jobs:
     name: Secret scan (gitleaks)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
       - name: Install gitleaks
@@ -40,13 +40,13 @@ jobs:
     name: Secret scan (trufflehog)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
       - name: Run TruffleHog
         env:
           HEAD_REF: ${{ github.ref_name }}
-        uses: trufflesecurity/trufflehog@main
+        uses: trufflesecurity/trufflehog@31ce31ee1abbcc7dc8eee5764c17121c3044c8b2 # v3.99.7
         with:
           base: ""
           head: ${{ env.HEAD_REF }}
@@ -57,7 +57,7 @@ jobs:
     runs-on: ubuntu-latest
     if: ${{ !inputs.skip-tests }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Check for pyproject.toml
         id: detect
         run: |
@@ -69,7 +69,7 @@ jobs:
           fi
       - name: Install uv
         if: steps.detect.outputs.is_python == 'true'
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
           python-version: ${{ inputs.python-version }}
           enable-cache: true
@@ -90,7 +90,7 @@ jobs:
     runs-on: ubuntu-latest
     if: ${{ !inputs.skip-tests }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Check for pyproject.toml
         id: detect
         run: |
@@ -101,7 +101,7 @@ jobs:
           fi
       - name: Install uv
         if: steps.detect.outputs.is_python == 'true'
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
           python-version: ${{ inputs.python-version }}
       - name: Run ruff check
