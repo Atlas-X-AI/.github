@@ -35,7 +35,7 @@ jobs:
 
     steps:
       - name: Enforce PR body contract
-        uses: actions/github-script@v8
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         env:
           PR_BODY: ${{ github.event.pull_request.body || '' }}
           ENFORCE_DRAFT: ${{ inputs.enforce_draft }}
